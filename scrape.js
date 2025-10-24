@@ -4,10 +4,12 @@ const fs = require('fs').promises; // 使用 fs.promises API
 const path = require('path');
 const { URL } = require('url');
 
+const GAME_ROOT_URL_HTTP = 'html5.gamedistribution.com/rvvASMiM/545999659d244efc9fa2d4bb3eeb7c38/';
+
 // -------------------------------------------------
 // 配置区域
 // -------------------------------------------------
-const GAME_ROOT_URL = 'https://www.crazygames.com/game/catch-tiles-piano-game/'; 
+const GAME_ROOT_URL = `https://${GAME_ROOT_URL_HTTP}`; 
 const DOWNLOAD_BASE_DIR = path.join(__dirname, 'downloads');
 
 // 【新增】配置阶段 3 (清单抓取)
