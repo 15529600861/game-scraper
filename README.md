@@ -1,4 +1,4 @@
-# Gamedistribution 游戏资源抓取脚本 (v17) - 操作文档
+# Gamedistribution 游戏资源抓取脚本 - 操作文档
 
 ## 1. 简介
 
