@@ -13,12 +13,12 @@ const { URL } = require('url');
 
 const GAMES_TO_SCRAPE = [
     { 
-        slug: "coffee-match-rush:-sort-puzzle", 
-        http_root: "html5.gamedistribution.com/rvvASMiM/4a042de4eb3d448cb1a31d6cc7382b02/" 
+        slug: "hexa-go!", 
+        http_root: "2c78611ed1104149a04c99a4f9f017b6" 
     },
     { 
-        slug: "vegamix-match-3-village", 
-        http_root: "html5.gamedistribution.com/rvvASMiM/8c1bfbc5d6814c8aa3061061e050b8b4/" 
+        slug: "red-stickman-vs-craftmans-2", 
+        http_root: "ee8b2be14fa24256b113d31a90835383" 
     },
     // ... 在这里添加更多游戏
 ];
@@ -73,7 +73,7 @@ async function gotoWithRetries(page, url, logPrefix, options) {
 async function scrapeGame(game, workerId) {
     // --- 1. 设置此任务的常量 ---
     const { slug: GAME_SLUG_NAME, http_root: GAME_ROOT_URL_HTTP } = game;
-    const GAME_ROOT_URL = `https://${GAME_ROOT_URL_HTTP}`;
+    const GAME_ROOT_URL = `https://html5.gamedistribution.com/rvvASMiM/${GAME_ROOT_URL_HTTP}/`;
     const logPrefix = `[Worker ${workerId} | ${GAME_SLUG_NAME}]`;
     
     console.log(`${logPrefix} 任务启动... 目标: ${GAME_ROOT_URL}`);
@@ -273,7 +273,7 @@ async function scrapeGame(game, workerId) {
             // 【v12 升级】使用带重试的 goto
             await gotoWithRetries(page, url, logPrefix, { 
                 waitUntil: 'load', 
-                timeout: 60000 
+                timeout: 120000 // 【v13 升级】超时增加到 120000 毫秒 (2分钟) 
             });
 
             const metadata = await page.evaluate(() => {
@@ -364,6 +364,8 @@ ${metadata.tags?.join(', ') || 'N/A'}
         // 【v12 升级】使用 stealth 模式
         browser = await puppeteer.launch({ 
             headless: true, // 推荐使用 "new" 或 true
+            // 【v13 升级】增加 protocolTimeout 解决 fetchFromBrowser 的 Runtime.callFunctionOn timed out 错误
+            protocolTimeout: 180000, // 180 秒 (3分钟)
         });
 
         // 2. 解析 URL 和路径
