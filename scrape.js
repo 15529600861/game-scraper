@@ -1,14 +1,15 @@
 /**
- * v20 合并版（全面自动抓取）
- * 关键增强：
- * - 跨域/CDN 资源：按后缀白名单 + 内容类型判断，落地到 _ext/<host>/...
- * - 206/Content-Range：识别分块响应，自动二次拉取完整体
- * - 自动交互：点击/按键 + 多轮 waitForNetworkIdle 触发延迟加载
- * - 误标 text/html：从“硬拦截”改为“软失败 + 告警”
- * - 资源发现扩展：新增 .mjs/.html 作为清单；正则覆盖 gif/webp/avif/otf/glb/gltf/ktx2/drc 等
- * - （可选）抓取 Service Worker 缓存中的资源
+ * v21 合并版（Auto + Cleaner）
  *
- * 保持：阶段化结构（0 元数据 / 1 被动监听 / 2 Unity JSON / 3 递归清单 / 4 模式推断）、日志、写盘策略。
+ * 关键能力：
+ * - 全自动阶段化抓取（0~5），保持你原有结构与日志
+ * - 跨域/CDN 资源：后缀白名单 + 内容类型判断，外域落地到 _ext/<host>/...
+ * - 206/Content-Range 分块：自动二次拉完整体，避免“半个文件”
+ * - 自动交互：点击/按键 + 多轮 waitForNetworkIdle 触发运行期加载
+ * - 误标 text/html：fetch 侧软失败告警；保存侧仍避免把非 index 的 HTML 当资源
+ * - 资源发现扩展：.mjs/.html 也扫，JS/CSS/HTML 正则更广，JSON 深搜字符串，支持 http 绝对路径
+ * - Service Worker 缓存抓取（如存在）
+ * - 资源判别器：拦广告/埋点/像素/小体积跨域 XHR 等无用资源；可切换策略
  */
 
 "use strict";
@@ -27,34 +28,38 @@ const crypto = require("crypto");
 // ----------------- 全局配置区域 ------------------
 // -------------------------------------------------
 
-// 任务队列（示例保持不变，可自行扩展）
+// 任务队列（示例，可自行扩展）
 const GAMES_TO_SCRAPE = [
   {
-    slug: "brainrot-mega-parkour",
-    http_root: "52c85b3037d84d5f9fbd7108bc832ccc",
-    folder_name: "brainrot-mega-parkour",
+    slug: "road-digging-puzzle",
+    http_root: "be305649d03f439eb03340d2bdf9543a",
   },
-  // { slug: "mega-lamba-ramp", http_root: "08f7196aa8c241dc81f27f118fa1f61e", folder_name: "mega-lamba-ramp" }, // 存在问题
+  // { slug: "scp-laboratory-idle-secret", http_root: "fa8eb6fd876d4423b1b1ec26f11ee394",folder_name: "scp-laboratory-idle-secret" },
+  // {
+  //   slug: "anime-dress-up-doll-dress-up",
+  //   http_root: "277a4d07d41345448bf22177767fdd32",
+  //   folder_name: "anime-dress-up-doll-dress-up",
+  // },
 ];
 
 // 并发 & 稳定性
 const CONCURRENCY_LIMIT = 1;
 const RETRY_LIMIT = 3;
-const STAGGER_DELAY_MS = 10000;
+const STAGGER_DELAY_MS = 20000;
 const PHASE1_EXTRA_WAIT_MS = 15000; // load 后额外等待
 const NETWORK_IDLE_IDLE_MS = 1500; // 每轮空闲窗口
 const NETWORK_IDLE_TIMEOUT_MS = 20000; // 每轮最大等待
 const AUTO_INTERACT_ROUNDS = 3; // 自动交互轮数
 
 // 推断策略
-const MAX_GUESSED_LEVEL_DEFAULT = 10; // 若没探测到关卡数字，默认最多猜 10
+const MAX_GUESSED_LEVEL_DEFAULT = 10;
 
 // 保存路径
 const DOWNLOAD_BASE_DIR = path.join(__dirname, "downloads");
 
-// ---------- v20：扩展扫描与后缀白名单 ----------
+// ---------- 资源发现/保存白名单 ----------
 const MANIFEST_FILE_EXTENSIONS = [
-  // 作为“清单/容器”扫描的文本类型
+  // 清单/容器：文本扫描
   ".js",
   ".mjs",
   ".html",
@@ -66,9 +71,8 @@ const MANIFEST_FILE_EXTENSIONS = [
   ".plist",
   ".fnt",
 ];
-
-// 覆盖更全面的静态资源后缀
 const ALLOWED_EXTS = new Set([
+  // 静态资源后缀
   ".js",
   ".mjs",
   ".json",
@@ -106,7 +110,6 @@ const ALLOWED_EXTS = new Set([
   ".ktx2",
   ".drc",
 ]);
-
 // 文本中的路径匹配（更广）
 const RESOURCE_REGEX =
   /(["'])([\w\-\/\.]+\.(json|png|jpg|jpeg|gif|webp|avif|mp3|ogg|wav|m4a|bin|data|bundle|txt|xml|atlas|unityweb|wasm|css|plist|fnt|svg|woff|woff2|ttf|otf|eot|mp4|webm|glb|gltf|ktx2|drc))\1/gi;
@@ -117,6 +120,74 @@ const INVALID_PATH_CHARS_REGEX = /[<>:"\/\\|?*]/;
 const ONLY_EXTENSION_REGEX = /^\.[a-zA-Z0-9]+$/;
 const REMAINING_ENCODING_REGEX = /%[0-9A-Fa-f]{2}/;
 const MAX_FILENAME_LENGTH = 200;
+
+// ===== 过滤相关配置（新增） =====
+const FILTER_MODE = "balanced"; // 'off' | 'balanced' | 'paranoid'
+const CROSS_ORIGIN_POLICY = "allowlist"; // 'all' | 'allowlist' | 'root-only'
+const EXTRA_ALLOWED_HOSTS = []; // 需要放行的第三方静态域
+const SKIP_EXTS = new Set([".map", ".md"]); // 典型无用资源，可自行调整
+const CORE_ENGINE_EXTS = new Set([".data", ".unityweb", ".wasm", ".bundle"]);
+const MIN_PIXEL_IMAGE_BYTES = 256;
+
+// 常见广告/统计/监控域（可按需增删）
+const TRACKING_HOST_PATTERNS = [
+  /(^|\.)googletagmanager\.com$/i,
+  /(^|\.)google-analytics\.com$/i,
+  /(^|\.)analytics\.google\.com$/i,
+  /(^|\.)doubleclick\.net$/i,
+  /(^|\.)googlesyndication\.com$/i,
+  /(^|\.)adservice\.google\.com$/i,
+  /(^|\.)adnxs\.com$/i,
+  /(^|\.)rubiconproject\.com$/i,
+  /(^|\.)criteo\.(com|net)$/i,
+  /(^|\.)pubmatic\.com$/i,
+  /(^|\.)taboola\.com$/i,
+  /(^|\.)outbrain\.com$/i,
+  /(^|\.)scorecardresearch\.com$/i,
+  /(^|\.)demdex\.net$/i,
+  /(^|\.)facebook\.com$/i,
+  /(^|\.)sentry\.io$/i,
+  /(^|\.)datadoghq\.com$/i,
+  /(^|\.)bugsnag\.com$/i,
+  /(^|\.)nr-data\.net$/i,
+  /(^|\.)newrelic\.com$/i,
+  /(^|\.)segment\.(io|com)$/i,
+  /(^|\.)mixpanel\.com$/i,
+  /(^|\.)amplitude\.com$/i,
+  /(^|\.)braze\.com$/i,
+  /(^|\.)appboy\.com$/i,
+  /(^|\.)intercom\.io$/i,
+  /(^|\.)onesignal\.com$/i,
+  /(^|\.)branch\.io$/i,
+  /(^|\.)appsflyer\.com$/i,
+  /(^|\.)adjust\.com$/i,
+];
+const PATH_KEYWORDS_BLOCK = [
+  "/ads/",
+  "/adservice",
+  "/prebid",
+  "/gpt",
+  "/impression",
+  "/pixel",
+  "/analytics",
+  "/collect",
+  "/beacon",
+  "/metrics",
+  "/stats",
+  "/sentry",
+  "/bugsnag",
+  "/datadog",
+  "/hotjar",
+  "/rollbar",
+  "/newrelic",
+  "/segment",
+  "/mixpanel",
+  "/amplitude",
+  "/onesignal",
+  "/intercom",
+  "/braze",
+  "/branch",
+];
 
 // -------------------------------------------------
 // ------------- 辅助函数 (全局) -------------------
@@ -151,17 +222,55 @@ async function scrapeGame(game, workerId) {
   const {
     slug: ORIGINAL_GAME_SLUG_NAME,
     http_root: GAME_INSTANCE_ID,
-    folder_name: DOWNLOAD_FOLDER_NAME,
+    folder_name: INPUT_FOLDER_NAME, // 不直接当目录名，用于后续判断
   } = game;
+
+  // 用 slug 生成一个“安全的”备用目录名（与原逻辑一致：只保留字母数字和连字符）
   const SANITIZED_GAME_SLUG_NAME = ORIGINAL_GAME_SLUG_NAME.replace(
     /[^a-zA-Z0-9\-]/g,
     ""
+  );
+
+  // 决定最终目录名：优先用非空的 folder_name，否则回退到 slug；再用 sanitize 做一次跨平台安全清洗
+  const DOWNLOAD_FOLDER_NAME = sanitize(
+    typeof INPUT_FOLDER_NAME === "string" && INPUT_FOLDER_NAME.trim().length > 0
+      ? INPUT_FOLDER_NAME.trim()
+      : SANITIZED_GAME_SLUG_NAME,
+    { replacement: "_" }
   );
   const GAME_ROOT_URL = `https://html5.gamedistribution.com/rvvASMiM/${GAME_INSTANCE_ID}/`;
   const LANDING_PAGE_URL = `https://gamedistribution.com/games/${ORIGINAL_GAME_SLUG_NAME}`;
   const logPrefix = `[Worker ${workerId} | ${ORIGINAL_GAME_SLUG_NAME}]`;
   const initialLevelPaths = new Set();
   const skippedFilesLog = [];
+
+  // 过滤统计
+  const allowedHosts = new Set([
+    new URL(GAME_ROOT_URL).host,
+    ...EXTRA_ALLOWED_HOSTS,
+  ]);
+  const assetReport = {
+    kept: 0,
+    skipped: 0,
+    reasons: {},
+    byHost: {},
+    byExt: {},
+  };
+  function _bump(obj, key) {
+    obj[key] = (obj[key] || 0) + 1;
+  }
+  function noteReport(keepOrSkip, url, reason, phaseName) {
+    const u = new URL(url);
+    const ext = (path.posix.extname(u.pathname) || "").toLowerCase();
+    if (keepOrSkip === "keep") {
+      assetReport.kept++;
+      _bump(assetReport.byHost, u.host);
+      _bump(assetReport.byExt, ext || "(none)");
+    } else {
+      assetReport.skipped++;
+      _bump(assetReport.reasons, `${reason}@${phaseName || "-"}`);
+    }
+  }
 
   console.log(`${logPrefix} 任务启动... 目标: ${GAME_ROOT_URL}`);
   console.log(
@@ -170,7 +279,7 @@ async function scrapeGame(game, workerId) {
 
   // --- 2) 内部工具（隔离） ---
 
-  // v20：把查询串哈希进文件名，避免覆盖
+  // 查询串哈希 → 避免同路径不同版本覆盖
   function appendQueryHash(relPath, urlObj) {
     if (!urlObj.search) return relPath;
     const qh = crypto
@@ -183,7 +292,7 @@ async function scrapeGame(game, workerId) {
     return path.posix.join(parsed.dir || "", baseWithHash);
   }
 
-  // v20：为任意 URL 生成“保存用相对路径”（含跨域与 index.html 逻辑）
+  // 为任意 URL 生成保存相对路径（含跨域规则）
   function proposeRelativePathForUrl(url) {
     const u = new URL(url);
     const inGameRoot = url.startsWith(GAME_ROOT_URL);
@@ -196,7 +305,105 @@ async function scrapeGame(game, workerId) {
     return rel;
   }
 
-  // v19：路径解码 + 校验（保留）
+  // 内容是否“像资产”
+  function isLikelyAsset(urlObj, headers) {
+    const ext = (path.posix.extname(urlObj.pathname) || "").toLowerCase();
+    if (ext && ALLOWED_EXTS.has(ext)) return true;
+    const ct = (
+      headers["content-type"] ||
+      headers["Content-Type"] ||
+      ""
+    ).toLowerCase();
+    if (!ct) return false;
+    if (ct.includes("text/html")) return false;
+    return (
+      /^(image|audio|video|font)\//.test(ct) ||
+      /application\/(octet-stream|wasm|json|x-font|vnd)/.test(ct)
+    );
+  }
+
+  // 资源判别器：在保存前统一判定是否跳过
+  function shouldSkipAsset(url, ctx = {}) {
+    if (FILTER_MODE === "off") return { skip: false };
+
+    const u = new URL(url);
+    const host = u.host;
+    const ext = (path.posix.extname(u.pathname) || "").toLowerCase();
+    const ct = (
+      ctx.headers?.["content-type"] ||
+      ctx.headers?.["Content-Type"] ||
+      ""
+    ).toLowerCase();
+    const len = parseInt(ctx.headers?.["content-length"] || "0", 10) || 0;
+    const rt = ctx.resourceType || "other";
+    const status = ctx.status || 0;
+    const inRoot = !!ctx.inGameRoot;
+
+    // 1) 永远保留：引擎关键件 & 根域静态资源
+    if (CORE_ENGINE_EXTS.has(ext)) return { skip: false };
+    if (inRoot && (ext || ct)) {
+      if (
+        ct.includes("text/html") &&
+        !u.pathname.endsWith("/") &&
+        !u.pathname.endsWith(".html")
+      ) {
+        return { skip: true, reason: "root-html-nonindex" };
+      }
+      return { skip: false };
+    }
+
+    // 2) 扩展名类“明显无关”
+    if (SKIP_EXTS.has(ext)) return { skip: true, reason: `skip-ext:${ext}` };
+
+    // 3) 域名黑名单（广告/统计/监控）
+    for (const p of TRACKING_HOST_PATTERNS) {
+      if (p.test(host)) return { skip: true, reason: "tracking-host" };
+    }
+
+    // 4) 路径关键词（埋点/广告）
+    const lowPath = (u.pathname + u.search).toLowerCase();
+    if (PATH_KEYWORDS_BLOCK.some((k) => lowPath.includes(k))) {
+      return { skip: true, reason: "tracking-path" };
+    }
+
+    // 5) 跨域策略
+    if (!inRoot) {
+      if (CROSS_ORIGIN_POLICY === "root-only")
+        return { skip: true, reason: "x-origin-block" };
+      if (CROSS_ORIGIN_POLICY === "allowlist" && !allowedHosts.has(host)) {
+        const looksBinary =
+          CORE_ENGINE_EXTS.has(ext) ||
+          (ext &&
+            ALLOWED_EXTS.has(ext) &&
+            !/\.js|\.mjs|\.json|\.html?$/.test(ext)) ||
+          /^(image|audio|video|font)\//.test(ct) ||
+          /application\/(octet-stream|wasm)/.test(ct);
+        if (looksBinary && (len >= 512 || ctx.preflight)) {
+          allowedHosts.add(host); // 自学习：放行一次后加入白名单
+        } else {
+          return { skip: true, reason: "x-origin-not-asset" };
+        }
+      }
+    }
+
+    // 6) 小像素图/无内容埋点
+    if (/^image\//.test(ct) && len > 0 && len < MIN_PIXEL_IMAGE_BYTES) {
+      if (/pixel|impression|track/.test(lowPath))
+        return { skip: true, reason: "tiny-pixel" };
+    }
+    if ((rt === "xhr" || rt === "fetch") && !inRoot) {
+      if (
+        status === 204 ||
+        (len > 0 && len < 512 && /json|plain|text/.test(ct))
+      ) {
+        return { skip: true, reason: "tiny-xhr-telemetry" };
+      }
+    }
+
+    return { skip: false };
+  }
+
+  // 路径解码与验证（保留）
   function getSafeRelativePath(
     originalRelativePath,
     originalUrl,
@@ -210,6 +417,7 @@ async function scrapeGame(game, workerId) {
       downloadResourceErrorHandler(e, originalUrl, phaseName, "路径解码失败");
       return null;
     }
+
     const basename = path.posix.basename(decodedPath);
     if (
       decodedPath.length === 0 ||
@@ -222,7 +430,7 @@ async function scrapeGame(game, workerId) {
         originalRelativePath === "index.html" &&
         decodedPath === "index.html"
       ) {
-        // 允许 index.html
+        // allow
       } else {
         downloadResourceErrorHandler(
           null,
@@ -245,24 +453,7 @@ async function scrapeGame(game, workerId) {
     return sanitized;
   }
 
-  // v20：判断响应是否为“可抓资源”（后缀或内容类型）
-  function isLikelyAsset(urlObj, headers) {
-    const ext = (path.posix.extname(urlObj.pathname) || "").toLowerCase();
-    if (ext && ALLOWED_EXTS.has(ext)) return true;
-    const ct = (
-      headers["content-type"] ||
-      headers["Content-Type"] ||
-      ""
-    ).toLowerCase();
-    if (!ct) return false;
-    if (ct.includes("text/html")) return false; // HTML 另行处理（仅保存 index.html）
-    return (
-      /^(image|audio|video|font)\//.test(ct) ||
-      /application\/(octet-stream|wasm|json|x-font|vnd)/.test(ct)
-    );
-  }
-
-  // v19：fetchFromBrowser（改为 text/html 软失败 + 告警）
+  // fetchFromBrowser：HTML 软失败 + 告警
   async function fetchFromBrowser(page, url) {
     try {
       if (page.isClosed()) throw new Error("Page was closed");
@@ -277,7 +468,7 @@ async function scrapeGame(game, workerId) {
               contentType,
             };
           }
-          // v20：不再硬拒 HTML（部分 CDN 误标），改为软告警
+          // 软失败：即便 text/html 也返回字节，由调用方决定是否保存
           const buffer = await response.arrayBuffer();
           return { data: Array.from(new Uint8Array(buffer)), contentType };
         } catch (e) {
@@ -299,7 +490,7 @@ async function scrapeGame(game, workerId) {
     }
   }
 
-  // v19：统一下载错误处理（保留）
+  // 统一下载错误处理（保留）
   function downloadResourceErrorHandler(
     error,
     originalUrlOrPath,
@@ -314,7 +505,7 @@ async function scrapeGame(game, workerId) {
       } else {
         displayPath = decodeURIComponent(originalUrlOrPath);
       }
-    } catch (e) {}
+    } catch {}
 
     const gameRootPathname = new URL(GAME_ROOT_URL).pathname;
     if (displayPath.startsWith(gameRootPathname)) {
@@ -346,7 +537,7 @@ async function scrapeGame(game, workerId) {
     }
   }
 
-  // v19：统一主动下载（改：允许跨域路径规则）
+  // 主动下载（带预判过滤）
   async function downloadAndSaveResource(
     page,
     fileFullUrl,
@@ -354,6 +545,16 @@ async function scrapeGame(game, workerId) {
     localGameDir,
     phaseName
   ) {
+    const pre = shouldSkipAsset(fileFullUrl, {
+      preflight: true,
+      inGameRoot: fileFullUrl.startsWith(GAME_ROOT_URL),
+      phaseName,
+    });
+    if (pre.skip) {
+      noteReport("skip", fileFullUrl, pre.reason, phaseName);
+      return;
+    }
+
     const safeRelativePath = getSafeRelativePath(
       originalFileRelPath,
       fileFullUrl,
@@ -371,6 +572,7 @@ async function scrapeGame(game, workerId) {
         console.log(
           `${logPrefix} [成功-${phaseName}] 已保存: ${safeRelativePath} (大小: ${buffer.length} B)`
         );
+        noteReport("keep", fileFullUrl, null, phaseName);
       } catch (writeError) {
         console.error(
           `${logPrefix} [失败-文件系统] 无法写入 "${localSavePath}": ${writeError.message}`
@@ -386,7 +588,7 @@ async function scrapeGame(game, workerId) {
     }
   }
 
-  // v20：被动响应处理（跨域 + 206 + HTML 软失败）
+  // 被动响应处理（跨域 + 206 + HTML 软失败 + 过滤）
   async function processResponse(
     page,
     response,
@@ -411,17 +613,26 @@ async function scrapeGame(game, workerId) {
       (urlObj.pathname === gameRootPathname || urlObj.pathname.endsWith("/"));
     const allowedByType =
       isLikelyAsset(urlObj, headers) || (inGameRoot && ext === ".html");
+    if (!isRootHtmlCandidate && !allowedByType) return;
 
-    if (!isRootHtmlCandidate && !allowedByType) {
-      // 非资源，跳过（减少无谓保存）
-      return;
-    }
-
-    // 记录“初始关卡路径”仅限根路径下（供模式推断）
+    // 记录初始路径（供模式推断）
     if (recordPaths && inGameRoot) {
       const relForRecord =
         urlObj.pathname.substring(gameRootPathname.length) || "index.html";
       if (relForRecord !== "index.html") initialLevelPaths.add(relForRecord);
+    }
+
+    // 过滤判定（保存前）
+    const decision = shouldSkipAsset(requestUrl, {
+      headers,
+      status,
+      resourceType: response.request().resourceType?.(),
+      inGameRoot,
+      phaseName: "被动",
+    });
+    if (decision.skip) {
+      noteReport("skip", requestUrl, decision.reason, "被动");
+      return;
     }
 
     processedUrls.add(requestUrl);
@@ -485,6 +696,7 @@ async function scrapeGame(game, workerId) {
         console.log(
           `${logPrefix} [成功-被动] 已保存: ${safeRelativePath} (大小: ${buffer.length} B)`
         );
+        noteReport("keep", requestUrl, null, "被动");
       } catch (writeError) {
         console.error(
           `${logPrefix} [失败-文件系统] 无法写入 "${localSavePath}": ${writeError.message}`
@@ -500,7 +712,7 @@ async function scrapeGame(game, workerId) {
     }
   }
 
-  // v19：阶段 2（Unity JSON）保持
+  // 阶段 2：Unity JSON 关键件补齐（保留）
   async function scrapeFromUnityJson(
     page,
     gameRootPathname,
@@ -516,7 +728,6 @@ async function scrapeGame(game, workerId) {
       console.log(`${logPrefix} --- 阶段 2 完成 ---`);
       return;
     }
-    const parsedJsonUrl = new URL(jsonUrl);
     const relJsonSaved = proposeRelativePathForUrl(jsonUrl);
     const safeRelJson = getSafeRelativePath(
       relJsonSaved,
@@ -536,6 +747,7 @@ async function scrapeGame(game, workerId) {
       console.log(`${logPrefix} --- 阶段 2 完成 ---`);
       return;
     }
+
     const urlKeys = [
       "dataUrl",
       "wasmCodeUrl",
@@ -572,7 +784,7 @@ async function scrapeGame(game, workerId) {
     console.log(`${logPrefix} --- 阶段 2 完成 ---`);
   }
 
-  // v20：阶段 3 扩展（跨域 + .mjs/.html + 更广后缀；允许 http 绝对路径）
+  // 阶段 3：递归清单（.js/.mjs/.html/.json/.css 等）
   async function scrapeFromManifestsRecursive(
     page,
     gameRootPathname,
@@ -580,7 +792,7 @@ async function scrapeGame(game, workerId) {
     processedUrls
   ) {
     console.log(
-      `\n${logPrefix} --- 阶段 3: 主动抓取(递归) JS/JSON/CSS/HTML 中的引用资源 ---`
+      `\n${logPrefix} --- 阶段 3: 主动抓取(递归) 清单中的引用资源 ---`
     );
     const scannedManifests = new Set();
     let loopCount = 0;
@@ -623,7 +835,6 @@ async function scrapeGame(game, workerId) {
       for (const manifestUrl of manifestsToScan) {
         scannedManifests.add(manifestUrl);
 
-        // 定位本地已保存的清单文件（与被动阶段一致的命名）
         const relSaved = proposeRelativePathForUrl(manifestUrl);
         const safeRel = getSafeRelativePath(
           relSaved,
@@ -650,24 +861,20 @@ async function scrapeGame(game, workerId) {
           continue;
         }
 
-        // 1) 基于正则（JS/CSS/HTML 文本）
+        // 1) 正则提取（JS/CSS/HTML 文本）
         let regex = isCss ? CSS_RESOURCE_REGEX : RESOURCE_REGEX;
         regex.lastIndex = 0;
         let match;
         while ((match = regex.exec(content)) !== null) {
           let foundPath = isCss ? match[2] : match[2];
           if (!foundPath) continue;
-
-          // 清理 CSS 中的 url(...) 包裹与片段锚点
           foundPath = foundPath
             .trim()
             .replace(/^["']|["']$/g, "")
-            .split("#")[0];
+            .split("#")[0]; // 清理
 
-          // 跳过 data/blob
           if (/^(data:|blob:|about:)/i.test(foundPath)) continue;
 
-          // 解析为绝对 URL
           let resolvedUrl;
           try {
             resolvedUrl = foundPath.startsWith("http")
@@ -677,12 +884,11 @@ async function scrapeGame(game, workerId) {
             continue;
           }
 
-          // 仅基于后缀粗筛（内容类型在真实请求时再判定）
           const ext2 = (
             path.posix.extname(new URL(resolvedUrl).pathname) || ""
           ).toLowerCase();
           if (!ext2 || !ALLOWED_EXTS.has(ext2)) {
-            // 保守起见：无扩展名的先忽略（避免把 HTML 页面当资源）
+            // 为防把 HTML 或接口当资源，只有明确后缀才加入
             continue;
           }
 
@@ -695,7 +901,7 @@ async function scrapeGame(game, workerId) {
           }
         }
 
-        // 2) JSON 深度取值（保持原有严谨性，稍微放宽：允许无扩展名 JSON 端点，失败再记录）
+        // 2) JSON 深搜：字符串值里可能藏着路径/接口
         if (isJson) {
           try {
             const jsonObj = JSON.parse(content);
@@ -716,8 +922,6 @@ async function scrapeGame(game, workerId) {
               } catch {
                 continue;
               }
-
-              // 若是站外或无扩展名：也允许尝试（保存时会走内容类型判断 & 路径安全）
               if (
                 !processedUrls.has(absUrl) &&
                 !newResourcesToDownload.has(absUrl)
@@ -766,7 +970,7 @@ async function scrapeGame(game, workerId) {
     console.log(`${logPrefix} --- 阶段 3 完成 ---`);
   }
 
-  // v20：阶段 4 模式推断（放宽：任意数字起点；上限=已见最大值+5 或默认）
+  // 阶段 4：模式推断（放宽：任意数字起点；上限=已见最大值+5 或默认）
   async function scrapeByPatternGuessing(
     page,
     gameRootPathname,
@@ -776,7 +980,6 @@ async function scrapeGame(game, workerId) {
     console.log(`\n${logPrefix} --- 阶段 4: 基于模式推断抓取资源 ---`);
     const guessedResourcesToDownload = new Map();
 
-    // 探测已见的最大数字
     let maxLevelFound = 0;
     const genericNumDirPattern = /\/(\d+)\//;
     for (const url of processedUrls) {
@@ -794,7 +997,6 @@ async function scrapeGame(game, workerId) {
       }；猜测上限: ${actualMaxGuess}`
     );
 
-    // 常见模式：levelNN / _NN_ / sceneNN / /NN/
     const levelPatterns = [
       { regex: /(level)(\d+)/i, replaceIndex: 2 },
       { regex: /(scene)(\d+)/i, replaceIndex: 2 },
@@ -856,11 +1058,9 @@ async function scrapeGame(game, workerId) {
     console.log(`${logPrefix} --- 阶段 4 完成 ---`);
   }
 
-  // v20：可选阶段 5——抓取 Service Worker 缓存中的请求（如存在）
+  // 阶段 5：抓取 SW 缓存（如存在）
   async function scrapeFromSWCaches(page, localGameDir, processedUrls) {
-    console.log(
-      `\n${logPrefix} --- 阶段 5: 抓取 Service Worker 缓存 (可选) ---`
-    );
+    console.log(`\n${logPrefix} --- 阶段 5: 抓取 Service Worker 缓存 ---`);
     let cachedUrls = [];
     try {
       cachedUrls = await page.evaluate(async () => {
@@ -890,9 +1090,17 @@ async function scrapeGame(game, workerId) {
       if (processedUrls.has(u)) continue;
       try {
         const urlObj = new URL(u);
-        // 基于后缀做一次粗筛；内容类型在真实下载时再校验
         const ext = (path.posix.extname(urlObj.pathname) || "").toLowerCase();
-        if (!ext || (!ALLOWED_EXTS.has(ext) && !u.endsWith("/"))) continue; // 避免把 HTML 页当资源
+        if (!ext || (!ALLOWED_EXTS.has(ext) && !u.endsWith("/"))) continue;
+        const pre = shouldSkipAsset(u, {
+          preflight: true,
+          inGameRoot: u.startsWith(GAME_ROOT_URL),
+          phaseName: "SW缓存",
+        });
+        if (pre.skip) {
+          noteReport("skip", u, pre.reason, "SW缓存");
+          continue;
+        }
         processedUrls.add(u);
         const rel = proposeRelativePathForUrl(u);
         toDownload.push(
@@ -918,7 +1126,7 @@ async function scrapeGame(game, workerId) {
     try {
       await gotoWithRetries(page, url, logPrefix, {
         waitUntil: "load",
-        timeout: 120000,
+        timeout: 200000,
       });
       const metadata = await page.evaluate(() => {
         const findContentByHeading = (text) => {
@@ -1081,7 +1289,7 @@ async function scrapeGame(game, workerId) {
     });
     console.log(`${logPrefix} 页面 "load" 已触发。`);
 
-    // v20：自动交互 + 多轮网络空闲（触发运行期加载）
+    // 自动交互 + 多轮网络空闲
     async function autoInteract(page) {
       try {
         const vp = page.viewport() || { width: 800, height: 600 };
@@ -1147,7 +1355,25 @@ async function scrapeGame(game, workerId) {
   } catch (e) {
     console.error(`${logPrefix} 发生致命错误: ${e.message}`);
   } finally {
-    // 保留 v19：记录跳过文件（仍按原位置，避免行为突变）
+    // 过滤报告
+    try {
+      const repPath = path.join(
+        DOWNLOAD_BASE_DIR,
+        DOWNLOAD_FOLDER_NAME,
+        "asset_report.json"
+      );
+      await fs.mkdir(path.dirname(repPath), { recursive: true });
+      await fs.writeFile(repPath, JSON.stringify(assetReport, null, 2));
+      console.log(
+        `${logPrefix} [信息] 过滤报告已写入 ${repPath}（保留:${assetReport.kept} 跳过:${assetReport.skipped}）`
+      );
+    } catch (e) {
+      console.warn(
+        `${logPrefix} [警告] 写入 asset_report.json 失败: ${e.message}`
+      );
+    }
+
+    // 保留你原来的 skipped_files.txt 位置与逻辑
     if (skippedFilesLog.length > 0) {
       const logPath = path.join(
         DOWNLOAD_BASE_DIR,
@@ -1179,7 +1405,7 @@ async function scrapeGame(game, workerId) {
 // -------------------------------------------------
 
 async function runPool() {
-  // 依赖检查（保留）
+  // 依赖检查（与原脚本一致）
   try {
     require.resolve("sanitize-filename");
   } catch {
