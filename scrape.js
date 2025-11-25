@@ -30,10 +30,11 @@ const crypto = require("crypto");
 
 // 任务队列（示例，可自行扩展）
 const GAMES_TO_SCRAPE = [
-  {
-    slug: "road-digging-puzzle",
-    http_root: "be305649d03f439eb03340d2bdf9543a",
-  },
+  // { slug: "screw-puzzle-1", http_root: "183019c559e34841b8df64ceb1d8f0c0" },
+
+{ slug: "super-hero-tycoon", http_root: "d5234914629a4ec997cfda65b2ae24ea" }  //   slug: "animal-sort-cute-puzzle-game",
+  //   http_root: "37a67d974d754010bc7dbb4d50db5c5c",
+  // },
   // { slug: "scp-laboratory-idle-secret", http_root: "fa8eb6fd876d4423b1b1ec26f11ee394",folder_name: "scp-laboratory-idle-secret" },
   // {
   //   slug: "anime-dress-up-doll-dress-up",
@@ -1126,7 +1127,7 @@ async function scrapeGame(game, workerId) {
     try {
       await gotoWithRetries(page, url, logPrefix, {
         waitUntil: "load",
-        timeout: 200000,
+        timeout: 300000,
       });
       const metadata = await page.evaluate(() => {
         const findContentByHeading = (text) => {
@@ -1260,6 +1261,8 @@ async function scrapeGame(game, workerId) {
     console.log(`\n${logPrefix} --- 阶段 0: 抓取元数据 (Metadata) ---`);
     const metadataPage = await browser.newPage();
     const metadata = await scrapeMetadata(metadataPage, LANDING_PAGE_URL);
+    console.log(`${logPrefix} --- ${metadata} ---`);
+    
     await saveMetadata(localGameDir, metadata);
     await scrapeImage(metadataPage, metadata.imageUrl, localGameDir);
     await metadataPage.close();
