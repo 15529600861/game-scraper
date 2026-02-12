@@ -32,7 +32,8 @@ const crypto = require("crypto");
 const GAMES_TO_SCRAPE = [
   // { slug: "screw-puzzle-1", http_root: "183019c559e34841b8df64ceb1d8f0c0" },
 
-{ slug: "super-hero-tycoon", http_root: "d5234914629a4ec997cfda65b2ae24ea" }  //   slug: "animal-sort-cute-puzzle-game",
+{ slug: "speed-run-3d", http_root: "68c91de8354345d38c54aa8f81e13393" },
+//   slug: "animal-sort-cute-puzzle-game",
   //   http_root: "37a67d974d754010bc7dbb4d50db5c5c",
   // },
   // { slug: "scp-laboratory-idle-secret", http_root: "fa8eb6fd876d4423b1b1ec26f11ee394",folder_name: "scp-laboratory-idle-secret" },
